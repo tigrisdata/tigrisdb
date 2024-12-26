@@ -31,37 +31,29 @@ import (
 var (
 	filterNone         = []byte(`{}`)
 	emptyFilter        = &EmptyFilter{}
-	WrappedEmptyFilter = &WrappedFilter{
+	wrappedEmptyFilter = &WrappedFilter{
 		Filter:       emptyFilter,
 		searchFilter: emptyFilter.ToSearchFilter(),
 	}
 )
 
-// A Filter represents a query filter that can have any multiple conditions, logical filtering, nested conditions, etc.
-// On a high level, a filter from a user query will map like this
-//
-//	{Selector} --> Filter with a single condition
-//	{Selector, Selector, LogicalOperator} --> Filter with two condition and a logicalOperator
-//	{Selector, LogicalOperator} --> Filter with single condition and a logicalOperator
-//	and so on...
-//
-// The JSON representation for these filters will look like below,
-// "filter: {"f1": 10}
+// Filter 接口表示一个通用的查询过滤器，可以包含多种条件和逻辑操作。
+// 支持 JSON 表示形式，例如：
+// "filter: {\"f1\": 10}"
 // "filter": [{"f1": 10}, {"f2": {"$gt": 10}}]
-// "filter": [{"f1": 10}, {"f2": 10}, {"$or": [{"f3": 20}, {"$and": [{"f4":5}, {"f5": 6}]}]}]
-//
-// The default rule applied between filters are "$and and the default selector is "$eq".
+// 默认操作为 "$and"，默认选择器为 "$eq"。
 type Filter interface {
-	// Matches returns true if the input doc passes the filter, otherwise false
+	// Matches 判断输入的文档是否符合过滤条件
 	Matches(doc []byte, metadata []byte) bool
-	// MatchesDoc similar to Matches but used when document is already parsed
+	// MatchesDoc 判断已解析的文档是否符合过滤条件
 	MatchesDoc(doc map[string]any) bool
+	// ToSearchFilter 将过滤器转换为搜索条件的字符串
 	ToSearchFilter() string
-	// IsSearchIndexed to let caller knows if there is any fields in the query not indexed in search. This
-	// will trigger full scan.
+	// IsSearchIndexed 检查过滤条件中是否使用了搜索索引
 	IsSearchIndexed() bool
 }
 
+// EmptyFilter 表示一个空过滤器，总是返回 true。
 type EmptyFilter struct{}
 
 func (*EmptyFilter) Matches(_ []byte, _ []byte) bool  { return true }
@@ -69,15 +61,16 @@ func (*EmptyFilter) MatchesDoc(_ map[string]any) bool { return true }
 func (*EmptyFilter) ToSearchFilter() string           { return "" }
 func (*EmptyFilter) IsSearchIndexed() bool            { return false }
 
+// WrappedFilter 用于包装其他过滤器，并支持逻辑组合。
 type WrappedFilter struct {
 	Filter
-
 	searchFilter string
 }
 
+// NewWrappedFilter 根据输入的过滤器数组创建一个 WrappedFilter。
 func NewWrappedFilter(filters []Filter) *WrappedFilter {
 	if len(filters) == 0 {
-		return WrappedEmptyFilter
+		return wrappedEmptyFilter
 	} else if len(filters) <= 1 {
 		return &WrappedFilter{
 			Filter:       filters[0],
@@ -85,13 +78,13 @@ func NewWrappedFilter(filters []Filter) *WrappedFilter {
 		}
 	}
 
-	andF := &AndFilter{
+	andFilter := &AndFilter{
 		filter: filters,
 	}
 
 	return &WrappedFilter{
-		Filter:       andF,
-		searchFilter: andF.ToSearchFilter(),
+		Filter:       andFilter,
+		searchFilter: andFilter.ToSearchFilter(),
 	}
 }
 
@@ -107,19 +100,14 @@ func (w *WrappedFilter) IsSearchIndexed() bool {
 	return w.Filter.IsSearchIndexed()
 }
 
-func None(reqFilter []byte) bool {
-	return len(reqFilter) == 0 || bytes.Equal(reqFilter, filterNone)
-}
-
+// Factory 是一个用于构建过滤器的工厂。
 type Factory struct {
-	fields    []*schema.QueryableField
-	collation *value.Collation
-	// For secondary Indexes do the following:
-	// 1. Reject Case insensitive queries
-	// 2. Always use Factory Top level collation because it will be a sort key collation
+	fields                 []*schema.QueryableField
+	collation              *value.Collation
 	buildForSecondaryIndex bool
 }
 
+// NewFactory 创建一个新的过滤器工厂。
 func NewFactory(fields []*schema.QueryableField, collation *value.Collation) *Factory {
 	return &Factory{
 		fields:                 fields,
@@ -128,6 +116,7 @@ func NewFactory(fields []*schema.QueryableField, collation *value.Collation) *Fa
 	}
 }
 
+// NewFactoryForSecondaryIndex 创建一个用于二级索引的过滤器工厂。
 func NewFactoryForSecondaryIndex(fields []*schema.QueryableField) *Factory {
 	return &Factory{
 		fields:                 fields,
@@ -136,6 +125,7 @@ func NewFactoryForSecondaryIndex(fields []*schema.QueryableField) *Factory {
 	}
 }
 
+// WrappedFilter 根据请求的 JSON 过滤器生成 WrappedFilter。
 func (factory *Factory) WrappedFilter(reqFilter []byte) (*WrappedFilter, error) {
 	filters, err := factory.Factorize(reqFilter)
 	if err != nil {
@@ -145,6 +135,7 @@ func (factory *Factory) WrappedFilter(reqFilter []byte) (*WrappedFilter, error) 
 	return NewWrappedFilter(filters), nil
 }
 
+// Factorize 将 JSON 过滤器解析为过滤器数组。
 func (factory *Factory) Factorize(reqFilter []byte) ([]Filter, error) {
 	if len(reqFilter) == 0 {
 		return nil, nil
@@ -152,6 +143,7 @@ func (factory *Factory) Factorize(reqFilter []byte) ([]Filter, error) {
 
 	var filters []Filter
 	var err error
+	// 遍历 JSON 对象的每个键值对
 	err = jsonparser.ObjectEach(reqFilter, func(k []byte, v []byte, jsonDataType jsonparser.ValueType, offset int) error {
 		if err != nil {
 			return err
@@ -179,11 +171,13 @@ func (factory *Factory) Factorize(reqFilter []byte) ([]Filter, error) {
 
 	return filters, nil
 }
-
-func (factory *Factory) UnmarshalFilter(input jsoniter.RawMessage) (expression.Expr, error) {
+// UnmarshalFilter 递归解析 JSON 并构造过滤器。
+func (factory *Factory) UnmarshalFilter(input jsoniter.RawMessage) (Filter, error) {
 	var err error
 	var filter Filter
-	parsingError := jsonparser.ObjectEach(input, func(k []byte, v []byte, dt jsonparser.ValueType, offset int) error {
+
+	// 遍历 JSON 对象并解析过滤器
+	err = jsonparser.ObjectEach(input, func(k []byte, v []byte, dt jsonparser.ValueType, offset int) error {
 		if err != nil {
 			return err
 		}
@@ -199,83 +193,80 @@ func (factory *Factory) UnmarshalFilter(input jsoniter.RawMessage) (expression.E
 		return nil
 	})
 
-	if parsingError != nil {
-		return filter, parsingError
+	if err != nil {
+		return nil, err
 	}
 
-	return filter, err
+	return filter, nil
 }
 
+// UnmarshalAnd 解析 AND 类型的过滤器。
 func (factory *Factory) UnmarshalAnd(input jsoniter.RawMessage) (Filter, error) {
-	expr, err := expression.UnmarshalArray(input, factory.UnmarshalFilter)
+	filters, err := factory.convertExprListToFilters(input)
 	if err != nil {
 		return nil, err
 	}
-	andFilters, err := convertExprListToFilters(expr)
-	if err != nil {
-		return nil, err
-	}
-
-	return NewAndFilter(andFilters)
+	return &AndFilter{filter: filters}, nil
 }
 
+// UnmarshalOr 解析 OR 类型的过滤器。
 func (factory *Factory) UnmarshalOr(input jsoniter.RawMessage) (Filter, error) {
-	expr, err := expression.UnmarshalArray(input, factory.UnmarshalFilter)
+	filters, err := factory.convertExprListToFilters(input)
 	if err != nil {
 		return nil, err
 	}
-	orFilters, err := convertExprListToFilters(expr)
-	if err != nil {
-		return nil, err
-	}
-
-	return NewOrFilter(orFilters)
+	return &OrFilter{filter: filters}, nil
 }
 
-func convertExprListToFilters(expr []expression.Expr) ([]Filter, error) {
-	filters := make([]Filter, 0, len(expr))
-	for _, e := range expr {
-		f, ok := e.(Filter)
-		if !ok {
-			return nil, ulog.CE("not able to decode to filter %v", f)
+// convertExprListToFilters 将表达式列表转换为过滤器列表。
+func (factory *Factory) convertExprListToFilters(input jsoniter.RawMessage) ([]Filter, error) {
+	var filters []Filter
+	var err error
+
+	_, err = jsonparser.ArrayEach(input, func(value []byte, dataType jsonparser.ValueType, offset int, errInner error) {
+		if err != nil {
+			return
 		}
-		filters = append(filters, f)
+
+		var filter Filter
+		filter, err = factory.UnmarshalFilter(value)
+		if err != nil {
+			return
+		}
+		filters = append(filters, filter)
+	})
+
+	if err != nil {
+		return nil, err
 	}
 
 	return filters, nil
 }
 
+// filterToQueryableField 根据过滤字段名称获取可查询字段。
 func (factory *Factory) filterToQueryableField(filterField string) (*schema.QueryableField, *schema.QueryableField) {
-	var (
-		field *schema.QueryableField
-		// parent is needed in case of an array where we need to extract first the array from the document.
-		parent *schema.QueryableField
-	)
-	for _, f := range factory.fields {
-		if f.Name() == filterField {
-			field = f
-			break
+	for _, field := range factory.fields {
+		if field.FieldName == filterField {
+			return field, nil
 		}
 
-		for _, nested := range f.AllowedNestedQFields {
-			if nested.Name() == filterField {
-				field = nested
-				parent = f
-				break
+		if field.DataType == schema.ObjectType || field.DataType == schema.ArrayType {
+			for _, subField := range field.Fields {
+				if subField.FieldName == filterField {
+					return subField, field
+				}
 			}
 		}
 	}
-
-	return field, parent
+	return nil, nil
 }
 
-// ParseSelector is a short-circuit for Selector i.e. when we know the filter passed is not logical then we directly
-// call this because if it is not logical then it is simply a Selector filter.
+// ParseSelector 解析单一字段选择器过滤器。
 func (factory *Factory) ParseSelector(k []byte, v []byte, dataType jsonparser.ValueType) (Filter, error) {
 	filterField := string(k)
 	field, parent := factory.filterToQueryableField(filterField)
 	if field == nil {
-		// try level - 1
+		// 检查字段是否在 schema 中定义
 		idx := strings.LastIndex(filterField, ".")
 		if idx <= 0 {
 			return nil, errors.InvalidArgument("querying on non schema field '%s'", string(k))
@@ -289,17 +280,12 @@ func (factory *Factory) ParseSelector(k []byte, v []byte, dataType jsonparser.Va
 		field = schema.NewDynamicQueryableField(filterField, filterField[idx+1:], schema.UnknownType)
 	}
 
-	if field == nil {
-		return nil, errors.InvalidArgument("querying on non schema field '%s'", string(k))
-	}
-
 	switch dataType {
 	case jsonparser.Boolean, jsonparser.Number, jsonparser.String, jsonparser.Array, jsonparser.Null:
 		tigrisType := toTigrisType(field, dataType)
 
 		if dataType == jsonparser.Null {
-			// need to explicitly set as nil otherwise, jsonparser is setting it as []byte{null}
-			v = nil
+			v = nil // 将 null 映射为 nil
 		}
 
 		var val value.Value
@@ -332,10 +318,7 @@ func (factory *Factory) ParseSelector(k []byte, v []byte, dataType jsonparser.Va
 	}
 }
 
-// buildValueMatcher is a helper method to create a value matcher object when the value of a Selector is an object
-// instead of a simple JSON value. Apart from comparison operators, this object can have its own collation, which
-// needs to be honored at the field level. Therefore, the caller needs to check if the collation returned by the
-// method is not nil and if yes, use this collation..
+// buildValueMatcher 构建用于匹配值的匹配器对象。
 func buildValueMatcher(input jsoniter.RawMessage, field *schema.QueryableField, factoryCollation *value.Collation, buildForSecondaryIndex bool) (ValueMatcher, LikeMatcher, *value.Collation, error) {
 	if len(input) == 0 {
 		return nil, nil, nil, errors.InvalidArgument("empty object")
@@ -343,7 +326,7 @@ func buildValueMatcher(input jsoniter.RawMessage, field *schema.QueryableField, 
 
 	var (
 		valueMatcher ValueMatcher
-		LikeMatcher  LikeMatcher
+		likeMatcher  LikeMatcher
 		collation    *value.Collation
 		err          error
 	)
@@ -363,7 +346,6 @@ func buildValueMatcher(input jsoniter.RawMessage, field *schema.QueryableField, 
 				tigrisType := toTigrisType(field, dataType)
 
 				var val value.Value
-				//nolint:gocritic
 				if buildForSecondaryIndex {
 					val, err = value.NewValueUsingCollation(tigrisType, v, factoryCollation)
 				} else if collation != nil {
@@ -386,7 +368,7 @@ func buildValueMatcher(input jsoniter.RawMessage, field *schema.QueryableField, 
 				return errors.InvalidArgument("field '%s' of type '%s' is not supported for 'regex/contains/not' filters. Only 'string' or an 'array of string' is supported", field.FieldName, schema.FieldNames[field.DataType])
 			}
 
-			LikeMatcher, err = NewLikeMatcher(string(key), string(v), collation)
+			likeMatcher, err = NewLikeMatcher(string(key), string(v), collation)
 			return err
 		case api.CollationKey:
 		default:
@@ -395,9 +377,10 @@ func buildValueMatcher(input jsoniter.RawMessage, field *schema.QueryableField, 
 		return nil
 	})
 
-	return valueMatcher, LikeMatcher, collation, err
+	return valueMatcher, likeMatcher, collation, err
 }
 
+// buildCollation 构建排序规则。
 func buildCollation(input jsoniter.RawMessage, factoryCollation *value.Collation, buildForSecondaryIndex bool) (*value.Collation, error) {
 	c, dt, _, _ := jsonparser.Get(input, api.CollationKey)
 	if dt == jsonparser.NotExist {
@@ -408,7 +391,6 @@ func buildCollation(input jsoniter.RawMessage, factoryCollation *value.Collation
 		err          error
 		apiCollation *api.Collation
 	)
-	// this will override the default collation
 	if err = jsoniter.Unmarshal(c, &apiCollation); err != nil {
 		return nil, err
 	}
@@ -424,6 +406,7 @@ func buildCollation(input jsoniter.RawMessage, factoryCollation *value.Collation
 	return collation, nil
 }
 
+// toTigrisType 将 JSON 类型转换为 Tigris 数据类型。
 func toTigrisType(field *schema.QueryableField, jsonType jsonparser.ValueType) schema.FieldType {
 	switch field.DataType {
 	case schema.ArrayType:
@@ -438,6 +421,7 @@ func toTigrisType(field *schema.QueryableField, jsonType jsonparser.ValueType) s
 	return field.DataType
 }
 
+// jsonToTigrisType 将 JSON 数据类型映射为 Tigris 数据类型。
 func jsonToTigrisType(jsonType jsonparser.ValueType) schema.FieldType {
 	switch jsonType {
 	case jsonparser.Boolean:
@@ -454,3 +438,4 @@ func jsonToTigrisType(jsonType jsonparser.ValueType) schema.FieldType {
 
 	return schema.UnknownType
 }
+
