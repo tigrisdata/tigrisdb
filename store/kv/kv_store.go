@@ -21,6 +21,67 @@ import (
 	"github.com/tigrisdata/tigris/internal"
 )
 
+// Add a global or instance-level cache
+var cache *LRUCache
+
+// Initialize the cache
+func init() {
+	cache = NewLRUCache(1000) // Set capacity to 1000 items
+}
+
+// Get retrieves a value from the store with cache support
+func (kv *KVStore) Get(key string) ([]byte, error) {
+	// Check the cache first
+	if value, found := cache.Get(key); found {
+		return value, nil
+	}
+
+	// Fallback to the underlying store
+	value, err := kv.backend.Get(key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store the result in the cache
+	cache.Put(key, value)
+	return value, nil
+}
+
+// Set stores a value in the store and updates the cache
+func (kv *KVStore) Set(key string, value []byte) error {
+	// Update the cache
+	cache.Put(key, value)
+
+	// Update the underlying store
+	return kv.backend.Set(key, value)
+}
+
+// Initialize TTL-enabled cache
+var ttlCache *TTLCache
+
+func init() {
+	ttlCache = NewTTLCache(1000, time.Minute) // Capacity 1000 items, cleanup every 1 minute
+}
+
+// Get with TTL support
+func (kv *KVStore) Get(key string) ([]byte, error) {
+	if value, found := ttlCache.Get(key); found {
+		return value, nil
+	}
+	value, err := kv.backend.Get(key)
+	if err != nil {
+		return nil, err
+	}
+	ttlCache.Put(key, value, 5*time.Minute) // Default 5 minutes TTL
+	return value, nil
+}
+
+// Set with TTL support
+func (kv *KVStore) SetWithTTL(key string, value []byte, ttl time.Duration) error {
+	ttlCache.Put(key, value, ttl)
+	return kv.backend.Set(key, value)
+}
+
 type KeyValueTxStore struct {
 	*fdbkv
 }
@@ -144,3 +205,30 @@ func (i *KeyValueIterator) Err() error {
 
 	return i.baseIterator.Err()
 }
+
+// BatchGet retrieves multiple keys at once
+func (kv *KVStore) BatchGet(keys []string) (map[string][]byte, error) {
+	results := make(map[string][]byte)
+	missedKeys := []string{}
+
+	for _, key := range keys {
+		if value, found := cache.Get(key); found {
+			results[key] = value
+		} else {
+			missedKeys = append(missedKeys, key)
+		}
+	}
+
+	if len(missedKeys) > 0 {
+		backendResults, err := kv.backend.BatchGet(missedKeys)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range backendResults {
+			cache.Put(k, v)
+			results[k] = v
+		}
+	}
+	return results, nil
+}
+
